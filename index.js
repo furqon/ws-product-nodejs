@@ -1,10 +1,59 @@
 const express = require('express')
 const pg = require('pg')
+const cors = require('cors')
+require('dotenv').config();
+
 
 const app = express()
+app.use(cors()) 
+
 // configs come from standard PostgreSQL env vars
 // https://www.postgresql.org/docs/9.6/static/libpq-envars.html
-const pool = new pg.Pool()
+const pool = new pg.Pool({
+  user: process.env.PGUSER,
+  host: process.env.PGHOST,
+  database: process.env.PGDATABASE,
+  password: process.env.PGPASSWORD,
+  port: process.env.PGPORT,
+})
+
+// simple rate limiting
+// https://kendru.github.io/javascript/2018/12/28/rate-limiting-in-javascript-with-a-token-bucket/
+class TokenBucket {
+  constructor(capacity, fillPerSecond) {
+    this.capacity = capacity;
+    this.tokens = capacity;
+    setInterval(() => this.addToken(), 1000 / fillPerSecond);
+  }
+
+  addToken() {
+    if (this.tokens < this.capacity) {
+      this.tokens += 1;
+    }
+  }
+
+  take() {
+    if (this.tokens > 0) {
+      this.tokens -= 1;
+      return true;
+    }
+
+    return false;
+  }
+}
+
+function limitRequests(perSecond, maxBurst) {
+  const bucket = new TokenBucket(maxBurst, perSecond);
+
+  // Return an Express middleware function
+  return function limitRequestsMiddleware(req, res, next) {
+      if (bucket.take()) {
+          next();
+      } else {
+          res.status(429).send('Rate limit exceeded');
+      }
+  }
+}
 
 const queryHandler = (req, res, next) => {
   pool.query(req.sqlQuery).then((r) => {
@@ -12,9 +61,23 @@ const queryHandler = (req, res, next) => {
   }).catch(next)
 }
 
-app.get('/', (req, res) => {
+app.get('/', limitRequests(5, 10), (req, res) => {
   res.send('Welcome to EQ Works 😎')
 })
+
+// get hourly data with date range parameters
+app.get('/stats/hourlyreport', (req, res, next) => {
+  const dateRage = req.query
+  req.sqlQuery = `
+  SELECT to_char(date, 'YYYYMMDD')::integer as datein, 
+    TO_CHAR(date, 'dd/mm/yyyy') as datelabel,
+    hour, impressions, clicks, revenue::float, poi_id
+    FROM public.hourly_stats
+    WHERE date >='${dateRage.fd}' and date <= '${dateRage.ld}'
+    ORDER BY date, hour
+  `
+  return next()
+}, queryHandler)
 
 app.get('/events/hourly', (req, res, next) => {
   req.sqlQuery = `
